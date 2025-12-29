@@ -1,0 +1,9 @@
+[project]
+name = "double-pendulum"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "gymnasium[classic-control]>=1.2.3",
+]
