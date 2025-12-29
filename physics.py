@@ -8,7 +8,7 @@ def generate_xml(
                 length2 : float,
                 ground : tuple[float, str], #this needs to be figured out, need to calculate ground in env.reset seperately
                 timestep : float,
-                ):
+                ) -> str:
 
     r = 0.02
     volume1 = length1 * np.pi * r * r
@@ -46,8 +46,6 @@ def generate_xml(
     </worldbody>
     <actuator>
         <motor name="motor0" joint="joint0" gear="1"/>
-    </actuator>
-    <actuator>
         <motor name="motor1" joint="joint1" gear="1"/>
     </actuator>
 
