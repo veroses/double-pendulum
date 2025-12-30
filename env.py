@@ -9,11 +9,19 @@ from physics import generate_xml
 '''
 TODO:
 
-add comments for each function articulating usage
+add comments for each function articulating usage/improve typehinting
 
-implement render
+implement _get_info to collect contacts and torques as well as changing state to robtot centric representation
 
 figure out file structure
+
+figure out randomized ground depth/angles
+
+smaller: 
+
+set a fixed fps (so that we dont run at 10000fps for small timesteps)
+try to see if its possible to keep the viewer open and just update states between episodes
+frameskips
 '''
 class DoublePendulum(gym.Env):
 
@@ -24,7 +32,7 @@ class DoublePendulum(gym.Env):
                  mass2 : float,
                  length1 : float,
                  length2 : float,
-                 timestep : float = 0.001,
+                 timestep : float = 0.002,
                  render_mode : str | None=None,
                  render_width : int = 640,
                  render_height : int = 480,
@@ -42,9 +50,9 @@ class DoublePendulum(gym.Env):
         self.state = np.array([-1, -1, -1, -1], dtype=np.float64) #in the form [theta1, theta2, omega1, omega2]
         self.torques = np.array([-1, -1], dtype=np.float64)
 
-        self.max_tau = 10.0
+        self.max_tau = 4.0
 
-        self.observation_space = gym.spaces.Box(low=np.array([0.0, 0.0, -40*np.pi, -40*np.pi]), high=np.array([2*np.pi, 2*np.pi, 40*np.pi, 40*np.pi]), shape=(4,), dtype=np.float64) #angl and omega values
+        self.observation_space = gym.spaces.Box(low=np.array([0.0, 0.0, -10*np.pi, -10*np.pi]), high=np.array([2*np.pi, 2*np.pi, 10*np.pi, 10*np.pi]), shape=(4,), dtype=np.float64) #angl and omega values
         self.action_space = gym.spaces.Box(low=-self.max_tau, high=self.max_tau, shape=(2,), dtype=np.float64) #joint torques
         
         if render_mode is not None and render_mode not in self.metadata["render_modes"]:
@@ -68,19 +76,91 @@ class DoublePendulum(gym.Env):
         #model + data created in reset()
         self.model = None
         self.data = None
+        self.body_ids = None
 
-    def _get_obs(self):
+        #CONSTANTS
+        self.substeps = 4 #substeps for mujoco per env.step
+        self.xi = 0.004 #contact distance threshold as described in the NeRD paper
+        self.max_contacts = 16
+
+
+    def _get_obs(self) -> np.ndarray:
         return np.array([self.state[0]% (2*np.pi), self.state[1] % (2*np.pi), self.state[2], self.state[3]], dtype=np.float64)
 
     def _get_info(self) -> dict:
-        'this is the state vector we input into the model'
-        #i think we want to be collecting mujuco trajectories here
-        #so collect robot state, [[thetas, omegas], taus, contacts] where taus is the torque on each joint,
-        #and contacts is in the form [robot contact point, world contact point, contact normal, contact distance ]
-        return {}
+        ''' this is where we calculate the inputs needed for the NeRD function. 
+        We need the robot-centric state representation (we don't include 6d velocity/spatial twist because the base is fixed), 
+        contacts, and gravity, as well as joint torques. These are returned as a flattened array under "state".
 
-    def _sync_state(self):
-        self.state[:] = np.array([self.data.qpos[0], self.data.qpos[1], self.data.qvel[0], self.data.qvel[1]], dtype=np.float64)
+        For calculation of our target, delta_s_t, we also need to return the rotation matrix and world frame pendulum position, 
+        which are returned under "R" and "world_pos" respectively.
+        '''
+        body = self.body_ids["link0"]
+
+        #STATE CALCULATION AND TRANSFORMATION
+        worldf_pos = self.data.xpos[body].copy()
+        worldf_R = self.data.xmat[body].reshape(3,3).copy()
+        thetas = self.state[:2]
+        omegas = self.state[2:4]
+        
+        basef_pos = np.zeros(shape=(3,), dtype=np.float64)
+        basef_R = np.identity(3)
+
+        s = np.concatenate([basef_pos, basef_R.reshape(-1), thetas, omegas])
+
+        #TORQUES
+        tau = self.torques
+
+        #CONTACT COLLECTION
+        K = self.max_contacts
+        contacts = []
+
+        for i in range(self.data.ncon):
+            contact = self.data.contact[i]
+            distance = contact.dist
+            if distance > self.xi:
+                continue
+            
+            normal = contact.frame[:3]
+
+            if contact.geom[0] == self.model.geom("floor").id:
+                p0 = contact.pos - 0.5*distance*normal
+                p1 = contact.pos + 0.5*distance*normal
+            else:
+                p0 = contact.pos + 0.5*distance*normal
+                p1 = contact.pos - 0.5*distance*normal
+
+            basef_p0 = worldf_R.T @ (p0 - worldf_pos)
+            basef_p1 = worldf_R.T @ (p1 - worldf_pos)
+            basef_normal = worldf_R.T @ normal
+            
+            contacts.append((distance, basef_p0, basef_p1, basef_normal))
+
+        contacts.sort(key=lambda x:x[0])
+
+        basef_contacts = np.zeros((K, 10), dtype=np.float64)
+        for j, (dist, p0, p1, n) in enumerate(contacts[:K]):
+            basef_contacts[j, 0:3] = p0
+            basef_contacts[j, 3:6] = p1
+            basef_contacts[j, 6:9] = n
+            basef_contacts[j, 9] = dist
+
+        #ROBOT-CENTRIC GRAVITY
+        worldf_gravity = self.model.opt.gravity
+        basef_g = worldf_R.T @ worldf_gravity
+
+        robot_state = np.concatenate([s, tau, basef_contacts.reshape(-1), basef_g])
+        
+        return {
+            "state" : robot_state,
+            "R" : worldf_R,
+            "world_pos" : worldf_pos
+        }
+
+
+    def _sync_state(self) -> None:
+        self.state[:2] = self.data.qpos[:]
+        self.state[2:4] = self.data.qvel[:]
 
     def reset(self, seed : Optional[int] = None, options : Optional[dict] = None):
         """Start a new episode.
@@ -98,7 +178,7 @@ class DoublePendulum(gym.Env):
         #generate thetas, omegas, taus
 
         thetas = self.np_random.uniform(0.0, 2*np.pi, size=2)
-        omegas = self.np_random.uniform(-40*np.pi, 40*np.pi, size=2)
+        omegas = self.np_random.uniform(-10*np.pi, 10*np.pi, size=2)
         self.state[:2] = thetas
         self.state[2:] = omegas
 
@@ -110,9 +190,13 @@ class DoublePendulum(gym.Env):
         ground_quat = "0 0 0 1"
         ground = (ground_depth, ground_quat)
 
-        xml = generate_xml(self.mass1, self.mass2, self.length1, self.length2, ground, self.dt)
+        model_timestep = self.dt / self.substeps
+        xml = generate_xml(self.mass1, self.mass2, self.length1, self.length2, ground, model_timestep)
         self.model = mujoco.MjModel.from_xml_string(xml) 
         self.data = mujoco.MjData(self.model)
+
+        self.body_ids = {"link0" : self.model.body("link0").id,
+                       "link1" : self.model.body("link1").id}
 
         #adjust thetas omegas and taus
         theta1, theta2, omega1, omega2 = self.state
@@ -133,14 +217,17 @@ class DoublePendulum(gym.Env):
         
 
 
-    def step(self, action : tuple[float, float]):
+    def step(self, action):
         action = np.asarray(action, dtype=np.float64).reshape(-1)
         tau1, tau2 = action
         tau1 = np.clip(tau1, -self.max_tau, self.max_tau)
         tau2 = np.clip(tau2, -self.max_tau, self.max_tau)
 
+        self.torques[:] = (tau1, tau2)
         self.data.ctrl[:] = (tau1, tau2)
-        mujoco.mj_step(self.model, self.data)
+
+        for _ in range(self.substeps):
+            mujoco.mj_step(self.model, self.data)
         
         self._sync_state()
 
@@ -199,7 +286,7 @@ class DoublePendulum(gym.Env):
 
         raise ValueError(f"Unknown render_mode={self.render_mode}")
 
-    def _destroy_rendering(self):
+    def _destroy_rendering(self) -> None:
         if self._viewer is not None:
             try:
                 self._viewer.close()
@@ -216,5 +303,5 @@ class DoublePendulum(gym.Env):
 
         self._last_render_time = None
 
-    def close(self):
+    def close(self) -> None:
         self._destroy_rendering()
