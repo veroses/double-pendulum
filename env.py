@@ -11,7 +11,9 @@ TODO:
 
 add comments for each function articulating usage/improve typehinting
 
-implement _get_info to collect contacts and torques as well as changing state to robtot centric representation
+fix _get_info right now we have a sorting heuristic with max K sensors, works as a preliminary but we want to be imlementing it a better way
+instead we can maybe transform collision point to body frame then figure out where on the body it is. bin based on whether its in ith part
+with the links segmented into K/2 parts
 
 figure out file structure
 
@@ -28,9 +30,9 @@ class DoublePendulum(gym.Env):
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 60}
 
     def __init__(self,
+                 mass0 : float,
                  mass1 : float,
-                 mass2 : float,
-                 length1 : float,
+                 lenght0 : float,
                  length2 : float,
                  timestep : float = 0.002,
                  render_mode : str | None=None,
@@ -40,9 +42,9 @@ class DoublePendulum(gym.Env):
                  ):
         #dont generate the model here
         
+        self.mass0 = mass0
         self.mass1 = mass1
-        self.mass2 = mass2
-        self.length1 = length1
+        self.lenght0 = lenght0
         self.length2 = length2
 
         self.dt = timestep
@@ -104,16 +106,22 @@ class DoublePendulum(gym.Env):
         omegas = self.state[2:4]
         
         basef_pos = np.zeros(shape=(3,), dtype=np.float64)
-        basef_R = np.identity(3)
+        basef_R = np.identity(3, dtype=np.float64)
 
         s = np.concatenate([basef_pos, basef_R.reshape(-1), thetas, omegas])
 
         #TORQUES
-        tau = self.torques
+        tau = np.asarray(self.torques, dtype=np.float64).reshape(2,)
 
         #CONTACT COLLECTION
         K = self.max_contacts
-        contacts = []
+        contacts = np.zeros(shape=(2*K,10), dtype=np.float64)
+        filled  = np.zeros((2*K,), dtype=np.bool_)
+       
+        link1 = self.body_ids["link1"]
+        worldf_R1 = self.data.xmat[link1].reshape(3,3).copy()
+        worldf_pos1 = self.data.xpos[link1].copy()
+        floor = self.model.geom("floor").id
 
         for i in range(self.data.ncon):
             contact = self.data.contact[i]
@@ -122,34 +130,64 @@ class DoublePendulum(gym.Env):
                 continue
             
             normal = contact.frame[:3]
-
-            if contact.geom[0] == self.model.geom("floor").id:
+            g0, g1 = contact.geom
+            b0 = self.model.geom_bodyid[g0]
+            b1 = self.model.geom_bodyid[g1]
+            if g0 == floor:
                 p0 = contact.pos - 0.5*distance*normal
                 p1 = contact.pos + 0.5*distance*normal
-            else:
+
+                if b1 == body: #link0
+                    p_body = worldf_R.T @ (p0 - worldf_pos)
+                    z = -p_body[2]
+                    bin_idx = int(np.clip((z*K)/self.length0, 0.0,  K - 1))
+                elif b1 == link1:
+                    p_body = worldf_R1.T @ (p0 - worldf_pos1)
+                    z = -p_body[2]
+                    bin_idx = int(np.clip((z*K)/self.length1, 0.0,  K - 1) + K)
+                else: continue
+
+            elif g1 == floor:
                 p0 = contact.pos + 0.5*distance*normal
                 p1 = contact.pos - 0.5*distance*normal
+
+                if b0 == body: #link0
+                    p_body = worldf_R.T @ (p0 - worldf_pos)
+                    z = -p_body[2]
+                    bin_idx = int(np.clip((z*K)/self.length0, 0.0,  K - 1))
+
+                elif b0 == link1:
+                    p_body = worldf_R1.T @ (p0 - worldf_pos1)
+                    z = -p_body[2]
+                    bin_idx = int(np.clip((z*K)/self.length1, 0.0,  K - 1) + K)
+                else:
+                    continue
+
+            else:
+                continue
 
             basef_p0 = worldf_R.T @ (p0 - worldf_pos)
             basef_p1 = worldf_R.T @ (p1 - worldf_pos)
             basef_normal = worldf_R.T @ normal
             
-            contacts.append((distance, basef_p0, basef_p1, basef_normal))
+            bin = contacts[bin_idx]
+        
+            if (not filled[bin_idx]) or distance < bin[9]:
+                bin[0:3] = basef_p0
+                bin[3:6] = basef_p1
+                bin[6:9] = basef_normal
+                bin[9] = distance
+                filled[bin_idx] = True
 
-        contacts.sort(key=lambda x:x[0])
-
-        basef_contacts = np.zeros((K, 10), dtype=np.float64)
-        for j, (dist, p0, p1, n) in enumerate(contacts[:K]):
-            basef_contacts[j, 0:3] = p0
-            basef_contacts[j, 3:6] = p1
-            basef_contacts[j, 6:9] = n
-            basef_contacts[j, 9] = dist
+            
+            
 
         #ROBOT-CENTRIC GRAVITY
         worldf_gravity = self.model.opt.gravity
         basef_g = worldf_R.T @ worldf_gravity
-
-        robot_state = np.concatenate([s, tau, basef_contacts.reshape(-1), basef_g])
+        
+        contacts = np.concatenate([contacts.reshape(-1), filled.astype(np.float32)])
+        robot_state = np.concatenate([s, tau, contacts, basef_g])
         
         return {
             "state" : robot_state,
@@ -191,7 +229,7 @@ class DoublePendulum(gym.Env):
         ground = (ground_depth, ground_quat)
 
         model_timestep = self.dt / self.substeps
-        xml = generate_xml(self.mass1, self.mass2, self.length1, self.length2, ground, model_timestep)
+        xml = generate_xml(self.mass0, self.mass1, self.lenght0, self.length2, ground, model_timestep)
         self.model = mujoco.MjModel.from_xml_string(xml) 
         self.data = mujoco.MjData(self.model)
 
