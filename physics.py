@@ -18,6 +18,13 @@ def generate_xml(
     density2 = mass2 / volume2
 
     ground_depth, ground_quat = ground #ground_pos = "x y z", ground_quat = "a b c d"
+
+    # Place the two fixed cameras at the pendulum's mid-height (it hangs from z=0 down
+    # to z=-(length1+length2)) and back them off by a distance that frames the full
+    # reach. cam0 looks along +Y (front), cam1 looks along +X (side).
+    total_len = length1 + length2
+    cam_z = -total_len / 2.0
+    cam_d = 2.5 * total_len + 0.5
     xml = f"""
 <mujoco>
     <option timestep="{timestep}" integrator="RK4">
@@ -25,13 +32,14 @@ def generate_xml(
     </option>
 
     <default>
-        <joint type="hinge" axis="0 1 0" damping="0.005"/>
+        <joint type="ball" damping="0.005"/>
         <geom type="cylinder" size="{r}" friction="0.1 0.005 0.0001"/>
     </default>
 
     <worldbody>
         <light pos="0 -.4 1"/>
-        <camera name="fixed" pos="0 -2 1" xyaxes="1 0 0 0 0 1"/>
+        <camera name="cam0" pos="0 {-cam_d} {cam_z}" xyaxes="1 0 0 0 0 1"/>
+        <camera name="cam1" pos="{-cam_d} 0 {cam_z}" xyaxes="0 -1 0 0 0 1"/>
 
             <geom name="floor" type="plane" pos="0 0 {ground_depth}" size="1.0 1.0 0.1" quat="{ground_quat}" friction="0.1 0.005 0.0001" rgba="0.9 0.9 0.9 1"/>
 
@@ -45,8 +53,12 @@ def generate_xml(
         </body>
     </worldbody>
     <actuator>
-        <motor name="motor0" joint="joint0" gear="1"/>
-        <motor name="motor1" joint="joint1" gear="1"/>
+        <motor name="motor0_x" joint="joint0" gear="1 0 0"/>
+        <motor name="motor0_y" joint="joint0" gear="0 1 0"/>
+        <motor name="motor0_z" joint="joint0" gear="0 0 1"/>
+        <motor name="motor1_x" joint="joint1" gear="1 0 0"/>
+        <motor name="motor1_y" joint="joint1" gear="0 1 0"/>
+        <motor name="motor1_z" joint="joint1" gear="0 0 1"/>
     </actuator>
 
 
