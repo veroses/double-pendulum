@@ -25,23 +25,23 @@ def generate_xml(
     </option>
 
     <default>
-        <joint type="hinge" axis="0 1 0" damping="0.05"/>
-        <geom type="cylinder" size="{r}" friction="1 0.005 0.0001"/>
+        <joint type="hinge" axis="0 1 0" damping="0.005"/>
+        <geom type="cylinder" size="{r}" friction="0.1 0.005 0.0001"/>
     </default>
 
     <worldbody>
         <light pos="0 -.4 1"/>
         <camera name="fixed" pos="0 -2 1" xyaxes="1 0 0 0 0 1"/>
 
-            <geom name="floor" type="plane" pos="0 0 {ground_depth}" size="5 5 0.1" quat="{ground_quat}" friction="1 0.005 0.0001" rgba="0.9 0.9 0.9 1"/>
+            <geom name="floor" type="plane" pos="0 0 {ground_depth}" size="1.0 1.0 0.1" quat="{ground_quat}" friction="0.1 0.005 0.0001" rgba="0.9 0.9 0.9 1"/>
 
         <body name="link0" pos="0 0 0">
-        <joint name="joint0"/>
-        <geom fromto="0 0 0 0 0 {-length1}" density="{density1}" rgba="1 1 0 1"/>
-        <body name="link1" pos="0 0 {-length1}">
-            <joint name="joint1"/>
-            <geom fromto="0 0 0 0 0 {-length2}" density="{density2}" rgba="1 0 0 1"/>
-        </body>
+            <joint name="joint0"/>
+            <geom fromto="0 0 0 0 0 {-length1}" density="{density1}" rgba="1 1 0 1"/>
+            <body name="link1" pos="0 0 {-length1}">
+                <joint name="joint1"/>
+                <geom fromto="0 0 0 0 0 {-length2}" density="{density2}" rgba="1 0 0 1"/>
+            </body>
         </body>
     </worldbody>
     <actuator>
