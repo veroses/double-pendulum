@@ -4,39 +4,43 @@ import numpy as np
 import time
 from typing import Optional
 from physics import generate_xml
-
-
-# TODO: figure out randomized ground depth/angles
-# TODO: try to keep the viewer open and just update states between episodes (avoid re-creating viewer on reset)
-# TODO: frameskips
+from utils import rotation_to_6d
 
 
 class DoublePendulum(gym.Env):
-    """Gymnasium environment for a 2-link planar double pendulum simulated in MuJoCo.
+    """Gymnasium environment for a 2-link spatial (3D) double pendulum simulated in MuJoCo.
 
     The pendulum hangs from a fixed base at the world origin. Both links are cylindrical
-    and actuated at their hinge joints (torque-controlled). The goal of this environment
-    is to generate rollout trajectories for training neural networks (e.g. NeRD).
+    and connected by ball joints, so each link has 3 rotational degrees of freedom and
+    can swing freely in 3D. Each joint is torque-controlled about all three of its local
+    axes. The goal of this environment is to generate rollout trajectories for training
+    neural networks (e.g. NeRD).
 
     Coordinate convention:
-        - The hinge axes are aligned with the world Y axis.
-        - Link geometry runs from the joint origin downward along the -Z axis.
-        - Angles (qpos) are measured from the downward-hanging rest position.
+        - Each link is connected to its parent by a ball joint (3 rotational DOF).
+        - Link geometry runs from the joint origin downward along the body -Z axis
+          (i.e. straight down when the joint is at its identity orientation).
 
-    Observation space (shape 4):
-        [θ₀ (rad, wrapped to [0, 2π]),
-         θ₁ (rad, wrapped to [0, 2π]),
-         ω₀ (rad/s),
-         ω₁ (rad/s)]
+    Degrees of freedom:
+        - qpos (8): two unit quaternions, one per ball joint, in (w, x, y, z) order.
+        - qvel (6): two 3-vectors of joint angular velocity (rad/s), in body axes.
 
-    Action space (shape 2):
-        [τ₀ (N·m), τ₁ (N·m)] — joint torques, clipped to ±max_tau.
+    Observation space (shape 14):
+        [quat0 (4,), quat1 (4,), angvel0 (3,), angvel1 (3,)]
+        i.e. the raw qpos followed by the raw qvel.
+
+    Action space (shape 6):
+        [τ0_x, τ0_y, τ0_z, τ1_x, τ1_y, τ1_z] (N·m) — torque about each joint's three
+        local axes, clipped to ±max_tau.
 
     The richer per-step state needed for NeRD training is returned in the `info` dict
     from both reset() and step() — see _get_info() for its structure.
     """
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 60}
+
+    # Camera names defined in the generated XML. rgb_array mode renders all of them.
+    CAMERA_NAMES = ("cam0", "cam1")
 
     def __init__(self,
                  mass0: float,
@@ -45,10 +49,10 @@ class DoublePendulum(gym.Env):
                  length1: float,
                  timestep: float = 0.002,
                  slide: bool = False,
+                 rgb_state: bool = False,
                  render_mode: str | None = None,
                  render_width: int = 640,
                  render_height: int = 480,
-                 camera_id: int | None = None,
                  ):
         """
         Args:
@@ -62,13 +66,16 @@ class DoublePendulum(gym.Env):
                          frames from render(). None disables rendering.
             render_width: Width in pixels for rgb_array rendering.
             render_height: Height in pixels for rgb_array rendering.
-            camera_id: MuJoCo camera ID to use for rgb_array rendering. None uses the
-                       default free camera.
             slide: If True, the ground is placed within contact range of the links
                    (randomised depth and tilt each episode) so the pendulum can
                    collide and slide along it. If False, the ground is parked well
                    below the pendulum and plays no role in the dynamics. Defaults
                    to False.
+            rgb_state: If True, every info dict (from reset() and step()) also
+                       carries one off-screen RGB frame per camera under the keys
+                       "rgb_<camera>" (e.g. "rgb_cam0", "rgb_cam1"). This renders
+                       independently of render_mode, so it works even with no
+                       viewer. It adds per-step render cost. Defaults to False.
         """
         self.mass0 = mass0
         self.mass1 = mass1
@@ -78,23 +85,27 @@ class DoublePendulum(gym.Env):
         self.dt = timestep
 
         # Internal physics state — written by _sync_state() after each mj_step.
+        # Layout: [qpos (8): two ball-joint quaternions, qvel (6): two angular velocities].
         # Initialised to sentinel values until reset() is called.
-        self.state = np.array([-1, -1, -1, -1], dtype=np.float64)   # [θ₀, θ₁, ω₀, ω₁]
-        self.torques = np.array([-1, -1], dtype=np.float64)          # [τ₀, τ₁]
+        self.state = np.full(14, -1.0, dtype=np.float64)
+        self.torques = np.full(6, -1.0, dtype=np.float64)  # [τ0_xyz, τ1_xyz]
 
         self.slide = slide
-        self.max_tau = 4.0  # N·m — symmetric torque limit applied to both joints
+        self.rgb_state = rgb_state
+        self.max_tau = 4.0  # N·m — symmetric torque limit applied to every actuator
 
+        # Observation = raw qpos (8 quaternion components in [-1, 1]) followed by raw
+        # qvel (6 angular velocities). Quaternion bounds are unit-norm components.
         self.observation_space = gym.spaces.Box(
-            low=np.array([0.0, 0.0, -10*np.pi, -10*np.pi]),
-            high=np.array([2*np.pi, 2*np.pi, 10*np.pi, 10*np.pi]),
-            shape=(4,),
+            low=np.concatenate([-np.ones(8), np.full(6, -10*np.pi)]),
+            high=np.concatenate([np.ones(8), np.full(6, 10*np.pi)]),
+            shape=(14,),
             dtype=np.float64,
         )
         self.action_space = gym.spaces.Box(
             low=-self.max_tau,
             high=self.max_tau,
-            shape=(2,),
+            shape=(6,),
             dtype=np.float64,
         )
 
@@ -104,7 +115,6 @@ class DoublePendulum(gym.Env):
 
         self._render_width = int(render_width)
         self._render_height = int(render_height)
-        self._camera_id = camera_id
 
         # Render objects are created lazily on first render() call and destroyed on reset().
         self._viewer = None           # mujoco.viewer handle — used for "human" mode
@@ -119,7 +129,9 @@ class DoublePendulum(gym.Env):
         # randomised per episode without re-instantiating the environment.
         self.model = None
         self.data = None
-        self.body_ids = None  # dict mapping body name → MuJoCo body id, populated in reset()
+        self.body_ids = None   # dict: body name → MuJoCo body id, populated in reset()
+        self.jnt_qadr = None   # list: qpos start index of [joint0, joint1]
+        self.jnt_vadr = None   # list: qvel/dof start index of [joint0, joint1]
 
         # --- Constants ---
         # Each env.step() calls mj_step this many times at a finer timestep (dt/substeps).
@@ -136,21 +148,16 @@ class DoublePendulum(gym.Env):
 
 
     def _get_obs(self) -> np.ndarray:
-        """Return the 4-dimensional observation for the current state.
+        """Return the 14-dimensional observation for the current state.
 
-        Angles are wrapped to [0, 2π] so the observation space bounds are always
-        respected. Angular velocities are returned unwrapped.
+        Layout matches self.state: the two ball-joint quaternions (qpos, 8) followed
+        by the two joint angular velocities (qvel, 6). Quaternions are already unit
+        norm so no wrapping is needed.
 
         Returns:
-            np.ndarray of shape (4,): [θ₀, θ₁, ω₀, ω₁]
+            np.ndarray of shape (14,): [quat0 (4,), quat1 (4,), angvel0 (3,), angvel1 (3,)]
         """
-        return np.array(
-            [self.state[0] % (2*np.pi),
-             self.state[1] % (2*np.pi),
-             self.state[2],
-             self.state[3]],
-            dtype=np.float64,
-        )
+        return self.state.copy()
 
     def _get_info(self) -> dict:
         """Compute the richer robot-centric state vector used for NeRD training.
@@ -181,15 +188,24 @@ class DoublePendulum(gym.Env):
         Returns:
             dict with keys:
                 "state"     : np.ndarray (float64) — flattened vector:
-                                  [basef_pos (3,), basef_R (9,), thetas (2,),
-                                   omegas (2,), tau (2,), contacts (2*K*10,),
-                                   filled (2*K,), basef_g (3,)]
-                                  Total length = 3 + 9 + 2 + 2 + 2 + 2*K*10 + 2*K + 3
-                                               = 181 for K=8.
+                                  [basef_pos (3,), basef_R (6,), R_joint0 (6,),
+                                   R_joint1 (6,), angvel0 (3,), angvel1 (3,),
+                                   tau (6,), contacts (2*K*10,), filled (2*K,),
+                                   basef_g (3,)]
+                                  Total length = 3 + 6 + 6 + 6 + 3 + 3 + 6
+                                               + 2*K*10 + 2*K + 3
+                                               = 212 for K=8.
+                                  Every orientation (base and both joints) is stored
+                                  in the continuous 6D rotation representation
+                                  (rotation_to_6d: the first two columns of the
+                                  rotation matrix). Reconstruct with rotation_from_6d.
                 "R"         : np.ndarray (3,3) — world-frame rotation matrix of link0.
                               Used externally to compute the NeRD target Δs_t.
                 "world_pos" : np.ndarray (3,) — world-frame position of link0's origin.
                               Also used to compute Δs_t.
+                "rgb_<cam>" : np.ndarray (H,W,3) uint8 — present only when rgb_state
+                              is True. One key per camera in CAMERA_NAMES (e.g.
+                              "rgb_cam0", "rgb_cam1").
         """
         body = self.body_ids["link0"]
         link1 = self.body_ids["link1"]
@@ -200,18 +216,30 @@ class DoublePendulum(gym.Env):
         worldf_pos1 = self.data.xpos[link1].copy()
         worldf_R1   = self.data.xmat[link1].reshape(3, 3).copy()
 
-        thetas = self.state[:2]
-        omegas = self.state[2:4]
+        # Joint configuration: convert each ball-joint quaternion (qpos) to a 3×3
+        # rotation matrix, and read each joint's angular velocity (qvel) directly.
+        quat_j0 = self.data.qpos[self.jnt_qadr[0] : self.jnt_qadr[0] + 4]
+        quat_j1 = self.data.qpos[self.jnt_qadr[1] : self.jnt_qadr[1] + 4]
+        w_j0    = self.data.qvel[self.jnt_vadr[0] : self.jnt_vadr[0] + 3].copy()
+        w_j1    = self.data.qvel[self.jnt_vadr[1] : self.jnt_vadr[1] + 3].copy()
+
+        R_j0_flat = np.zeros(9, dtype=np.float64)
+        R_j1_flat = np.zeros(9, dtype=np.float64)
+        mujoco.mju_quat2Mat(R_j0_flat, quat_j0)
+        mujoco.mju_quat2Mat(R_j1_flat, quat_j1)
+        # mju_quat2Mat fills row-major, so reshape(3,3) gives the true matrix.
+        R_j0 = rotation_to_6d(R_j0_flat.reshape(3, 3))
+        R_j1 = rotation_to_6d(R_j1_flat.reshape(3, 3))
 
         # Because the base is fixed to the world, the base-frame position is the origin
         # and the base-frame rotation is identity. We include them explicitly so the
         # state vector has a consistent structure if the base ever becomes free.
-        basef_pos = np.zeros(3, dtype=np.float64)
-        basef_R   = np.eye(3, dtype=np.float64)
+        basef_pos  = np.zeros(3, dtype=np.float64)
+        basef_R_6d = rotation_to_6d(np.eye(3, dtype=np.float64))
 
-        s = np.concatenate([basef_pos, basef_R.reshape(-1), thetas, omegas])
+        s = np.concatenate([basef_pos, basef_R_6d, R_j0, R_j1, w_j0, w_j1])
 
-        tau = np.asarray(self.torques, dtype=np.float64).reshape(2,)
+        tau = np.asarray(self.torques, dtype=np.float64).reshape(6,)
 
         # --- Contact collection ---
         K = self.segments_per_link
@@ -295,11 +323,18 @@ class DoublePendulum(gym.Env):
         contacts_flat = np.concatenate([contacts.reshape(-1), filled.astype(np.float32)])
         robot_state   = np.concatenate([s, tau, contacts_flat, basef_g])
 
-        return {
+        info = {
             "state":     robot_state,
             "R":         worldf_R,
             "world_pos": worldf_pos,
         }
+
+        # Optionally attach one RGB frame per camera, keyed "rgb_<camera>".
+        if self.rgb_state:
+            for cam, frame in self._render_rgb().items():
+                info[f"rgb_{cam}"] = frame
+
+        return info
 
 
     def _sync_state(self) -> None:
@@ -307,10 +342,10 @@ class DoublePendulum(gym.Env):
 
         Called after every mj_step / mj_forward to keep self.state in sync with
         the MuJoCo data buffer. self.state is the authoritative Python-side cache
-        used by _get_obs() and _get_info().
+        used by _get_obs() and _get_info(). Layout: [qpos (8), qvel (6)].
         """
-        self.state[:2] = self.data.qpos[:]
-        self.state[2:4] = self.data.qvel[:]
+        self.state[:8] = self.data.qpos[:]
+        self.state[8:] = self.data.qvel[:]
 
 
     def _sample_ground(self, slide=True) -> tuple[float, np.ndarray]:
@@ -375,26 +410,33 @@ class DoublePendulum(gym.Env):
                   class which initialises self.np_random.
             options: Reserved for overriding specific initial conditions in testing.
                      Intended format (not yet implemented):
-                     {"ground": (depth, quat), "thetas": (θ₀, θ₁), "omegas": (ω₀, ω₁)}
+                     {"ground": (depth, quat), "quats": (q0, q1), "angvels": (w0, w1)}
 
         Returns:
-            observation (np.ndarray): Initial observation of shape (4,).
+            observation (np.ndarray): Initial observation of shape (14,).
             info (dict): Initial NeRD state dict from _get_info().
         """
         super().reset(seed=seed)
 
-        thetas = self.np_random.uniform(0.0, 2*np.pi, size=2)
-        omegas = self.np_random.uniform(-10*np.pi, 10*np.pi, size=2)
-        self.state[:2] = thetas
-        self.state[2:]  = omegas
+        # Random initial joint orientations, uniform over rotations: sampling 4
+        # i.i.d. Gaussians and normalising gives a uniform point on the unit
+        # quaternion sphere (and hence a uniform random rotation).
+        q0 = self.np_random.normal(size=4); q0 /= np.linalg.norm(q0)
+        q1 = self.np_random.normal(size=4); q1 /= np.linalg.norm(q1)
+        quats = np.concatenate([q0, q1])
 
-        self.torques = self.np_random.uniform(-self.max_tau, self.max_tau, size=2)
-        tau1, tau2 = self.torques
+        # Random initial joint angular velocities (rad/s), per local axis.
+        angvels = self.np_random.uniform(-10*np.pi, 10*np.pi, size=6)
+
+        self.state[:8] = quats
+        self.state[8:] = angvels
+
+        self.torques = self.np_random.uniform(-self.max_tau, self.max_tau, size=6)
 
         ground_depth, ground_quat = self._sample_ground(slide=self.slide)
 
         if self.model is None:
-            # First reset: build model from XML and cache body IDs.
+            # First reset: build model from XML and cache body ids + joint addresses.
             ground_quat_str = " ".join(str(v) for v in ground_quat)
             model_timestep  = self.dt / self.substeps
             xml = generate_xml(self.mass0, self.mass1, self.length0, self.length1,
@@ -405,6 +447,10 @@ class DoublePendulum(gym.Env):
                 "link0": self.model.body("link0").id,
                 "link1": self.model.body("link1").id,
             }
+            self.jnt_qadr = [int(self.model.joint("joint0").qposadr[0]),
+                             int(self.model.joint("joint1").qposadr[0])]
+            self.jnt_vadr = [int(self.model.joint("joint0").dofadr[0]),
+                             int(self.model.joint("joint1").dofadr[0])]
         else:
             # Subsequent resets: patch ground geometry in-place so the viewer
             # window doesn't need to close/reopen.
@@ -414,9 +460,9 @@ class DoublePendulum(gym.Env):
             # Reset all of data back to defaults (zeros qpos/qvel, clears contacts etc.)
             mujoco.mj_resetData(self.model, self.data)
 
-        self.data.qpos[:] = thetas
-        self.data.qvel[:] = omegas
-        self.data.ctrl[:] = [tau1, tau2]
+        self.data.qpos[:] = quats
+        self.data.qvel[:] = angvels
+        self.data.ctrl[:] = self.torques
 
         # mj_forward propagates the initial state through the kinematics/dynamics
         # without advancing time, so xpos/xmat/contacts are all valid after this call.
@@ -436,10 +482,11 @@ class DoublePendulum(gym.Env):
         `substeps` MuJoCo integration steps, then returns the new state.
 
         Args:
-            action: Array-like of shape (2,) containing [τ₀, τ₁] in N·m.
+            action: Array-like of shape (6,) containing per-axis joint torques
+                    [τ0_x, τ0_y, τ0_z, τ1_x, τ1_y, τ1_z] in N·m.
 
         Returns:
-            observation (np.ndarray): Shape (4,) — see _get_obs().
+            observation (np.ndarray): Shape (14,) — see _get_obs().
             reward (float): Always 0.0 — reward shaping is left to wrappers.
             terminated (bool): True if any state value becomes non-finite (simulation
                                blow-up). The episode should be reset immediately.
@@ -448,11 +495,10 @@ class DoublePendulum(gym.Env):
             info (dict): NeRD state dict from _get_info().
         """
         action = np.asarray(action, dtype=np.float64).reshape(-1)
-        tau1 = np.clip(action[0], -self.max_tau, self.max_tau)
-        tau2 = np.clip(action[1], -self.max_tau, self.max_tau)
+        taus = np.clip(action, -self.max_tau, self.max_tau)
 
-        self.torques[:] = (tau1, tau2)
-        self.data.ctrl[:] = (tau1, tau2)
+        self.torques[:] = taus
+        self.data.ctrl[:] = taus
 
         for _ in range(self.substeps):
             mujoco.mj_step(self.model, self.data)
@@ -475,11 +521,12 @@ class DoublePendulum(gym.Env):
         """Render the current simulation state.
 
         Behaviour depends on render_mode set at construction:
-            "human"     — syncs the passive viewer window. Real-time pacing is
-                          applied so the simulation plays back at wall-clock speed.
-                          Returns None.
-            "rgb_array" — renders an off-screen frame and returns it as a
-                          (H, W, 3) uint8 numpy array.
+            "human"     — syncs the passive viewer window (single default camera).
+                          Real-time pacing is applied so the simulation plays back at
+                          wall-clock speed. Returns None.
+            "rgb_array" — renders one off-screen frame per camera in CAMERA_NAMES and
+                          returns them as a tuple of (H, W, 3) uint8 numpy arrays
+                          (one per camera, in CAMERA_NAMES order).
             None        — no-op, returns None.
 
         Raises:
@@ -512,17 +559,35 @@ class DoublePendulum(gym.Env):
             return None
 
         if self.render_mode == "rgb_array":
-            if self._renderer is None:
-                self._renderer = mujoco.Renderer(self.model, height=self._render_height, width=self._render_width)
-
-            if self._camera_id is None:
-                self._renderer.update_scene(self.data)
-            else:
-                self._renderer.update_scene(self.data, camera=self._camera_id)
-
-            return self._renderer.render().copy()  # copy so the caller owns the buffer
+            return tuple(self._render_rgb().values())
 
         raise ValueError(f"Unknown render_mode={self.render_mode}")
+
+
+    def _render_rgb(self) -> dict[str, np.ndarray]:
+        """Render one off-screen RGB frame per camera.
+
+        Shared by render() (for "rgb_array" mode) and _get_info() (for the
+        rgb_state option), so both paths use the same renderer and camera loop.
+        The off-screen renderer is created lazily on first use and torn down by
+        close(); it is independent of render_mode, so RGB frames are available
+        even when no viewer is open.
+
+        Returns:
+            dict mapping camera name (from CAMERA_NAMES) → (H, W, 3) uint8 frame.
+            Each frame is a fresh copy, so the caller owns the buffer.
+        """
+        if self.model is None or self.data is None:
+            raise RuntimeError("Call reset() before rendering RGB frames.")
+
+        if self._renderer is None:
+            self._renderer = mujoco.Renderer(self.model, height=self._render_height, width=self._render_width)
+
+        frames = {}
+        for cam in self.CAMERA_NAMES:
+            self._renderer.update_scene(self.data, camera=cam)
+            frames[cam] = self._renderer.render().copy()
+        return frames
 
 
     def _destroy_rendering(self) -> None:
