@@ -140,7 +140,7 @@ class DoublePendulum(gym.Env):
 
         # Contact distance threshold (metres) from the NeRD paper.
         # Only contacts with dist ≤ xi are included in the info state vector.
-        self.xi = 0.004
+        self.xi = 0.08
 
         # Number of bins each link is divided into for contact localisation.
         # Higher K → finer spatial resolution of where contact occurs along the link.
