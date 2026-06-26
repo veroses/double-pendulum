@@ -1,4 +1,26 @@
 import numpy as np
+import torch
+import torch.nn.functional as F
+
+
+def downsample_rgb(img: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
+    """Downsample an (N, M, 3) uint8 RGB array to (out_h, out_w, 3) using area averaging.
+
+    Area mode averages all input pixels that map to each output pixel, which is the
+    correct anti-aliasing strategy for downsampling (as opposed to bilinear, which
+    samples at a point and aliases).
+
+    Args:
+        img: uint8 array of shape (N, M, 3).
+        out_h: Target height in pixels.
+        out_w: Target width in pixels.
+
+    Returns:
+        uint8 array of shape (out_h, out_w, 3).
+    """
+    t = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).float()  # (1, 3, N, M)
+    t = F.interpolate(t, size=(out_h, out_w), mode="area")            # (1, 3, out_h, out_w)
+    return t.squeeze(0).permute(1, 2, 0).byte().numpy()               # (out_h, out_w, 3)
 
 
 def rotation_to_6d(R: np.ndarray) -> np.ndarray:
