@@ -51,7 +51,7 @@ class DoublePendulum(gym.Env):
                  slide: bool = False,
                  rgb_state: bool = False,
                  render_mode: str | None = None,
-                 render_width: int = 640,
+                 render_width: int = 480,
                  render_height: int = 480,
                  ):
         """
@@ -426,7 +426,7 @@ class DoublePendulum(gym.Env):
         quats = np.concatenate([q0, q1])
 
         # Random initial joint angular velocities (rad/s), per local axis.
-        angvels = self.np_random.uniform(-10*np.pi, 10*np.pi, size=6)
+        angvels = self.np_random.uniform(-4*np.pi, 4*np.pi, size=6)
 
         self.state[:8] = quats
         self.state[8:] = angvels
