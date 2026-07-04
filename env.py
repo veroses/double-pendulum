@@ -47,7 +47,7 @@ class DoublePendulum(gym.Env):
                  mass1: float,
                  length0: float,
                  length1: float,
-                 timestep: float = 0.002,
+                 timestep: float = 1/60,
                  slide: bool = False,
                  rgb_state: bool = False,
                  render_mode: str | None = None,
@@ -92,13 +92,13 @@ class DoublePendulum(gym.Env):
 
         self.slide = slide
         self.rgb_state = rgb_state
-        self.max_tau = 4.0  # N·m — symmetric torque limit applied to every actuator
+        self.max_tau = 2.0  # N·m — symmetric torque limit applied to every actuator
 
         # Observation = raw qpos (8 quaternion components in [-1, 1]) followed by raw
         # qvel (6 angular velocities). Quaternion bounds are unit-norm components.
         self.observation_space = gym.spaces.Box(
-            low=np.concatenate([-np.ones(8), np.full(6, -10*np.pi)]),
-            high=np.concatenate([np.ones(8), np.full(6, 10*np.pi)]),
+            low=np.concatenate([-np.ones(8), np.full(6, -4*np.pi)]),
+            high=np.concatenate([np.ones(8), np.full(6, 4*np.pi)]),
             shape=(14,),
             dtype=np.float64,
         )

@@ -32,7 +32,7 @@ ACTION_DIM = 6
 OUT_DIR    = "data"
 
 
-def _make_env() -> DoublePendulum:
+def _make_env(slide: bool=True) -> DoublePendulum:
     # timestep defaults to 1/60 → mujoco model dt = (1/60)/4 = 1/240 s (240 Hz)
     return DoublePendulum(
         mass0=1.0,
@@ -42,11 +42,12 @@ def _make_env() -> DoublePendulum:
         rgb_state=True,
         render_width=256,
         render_height=256,
+        slide=slide
     )
 
 
-def collect_shard(shard_idx: int, out_dir: str) -> None:
-    env = _make_env()
+def collect_shard(shard_idx: int, out_dir: str, slide: bool=True) -> None:
+    env = _make_env(slide)
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"shard_{shard_idx:03d}.h5")
 
@@ -99,6 +100,7 @@ def main() -> None:
         "--shard", type=int, default=None,
         help=f"Shard index in [0, {N_SHARDS - 1}]. Omit to run all shards sequentially.",
     )
+    parser.add_argument("--no-slide", dest="slide", action="store_false", default=True)
     parser.add_argument(
         "--out_dir", type=str, default=OUT_DIR,
         help="Output directory for HDF5 shard files.",
@@ -108,10 +110,10 @@ def main() -> None:
     if args.shard is not None:
         if not (0 <= args.shard < N_SHARDS):
             raise ValueError(f"--shard must be in [0, {N_SHARDS - 1}], got {args.shard}")
-        collect_shard(args.shard, args.out_dir)
+        collect_shard(args.shard, args.out_dir, slide=args.slide)
     else:
         for i in range(N_SHARDS):
-            collect_shard(i, args.out_dir)
+            collect_shard(i, args.out_dir, slide=args.slide)
 
 
 if __name__ == "__main__":
