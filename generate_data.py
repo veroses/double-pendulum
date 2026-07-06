@@ -106,7 +106,7 @@ def main() -> None:
         help="Output directory for HDF5 shard files.",
     )
     args = parser.parse_args()
-
+    
     if args.shard is not None:
         if not (0 <= args.shard < N_SHARDS):
             raise ValueError(f"--shard must be in [0, {N_SHARDS - 1}], got {args.shard}")
