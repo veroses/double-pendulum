@@ -11,12 +11,9 @@ The model is a thin, NeRD-style wrapper around three pieces:
         * VisionEncoderConfig -> VisionEncoder (two camera views + torque)
   2. GPT dynamics core — a causal GPT-2-style transformer that attends over the
      history window and mixes the per-step tokens (see transformer.py).
-  3. Δs head — a small MLP that maps the core output to the predicted state
-     delta. The next state is recovered elsewhere as s_{t+1} = s_t ⊕ Δs.
-
-Adapted from a more general "mixed input" model; the RNN path and the
-stochastic/​tanh output paths were dropped — this project only ever needs the
-single transformer core with a deterministic Δs head.
+  3. Δs head — a small MLP (a reused MLPEncoder) that maps the core output to
+     the predicted state delta. The next state is recovered elsewhere as
+     s_{t+1} = s_t ⊕ Δs.
 """
 
 from dataclasses import dataclass, field, replace
@@ -34,53 +31,6 @@ from transformer import GPT, GPTConfig
 
 
 # --------------------------------------------------------------------------- #
-# Δs head — STUB
-# --------------------------------------------------------------------------- #
-class MLPHead(nn.Module):
-    """State-delta (Δs) prediction head.
-
-    PLACEHOLDER: this is a deliberately plain MLP standing in for the "real"
-    head that will eventually live here (residual blocks, normalisation, etc.).
-    It is functional so the rest of DynamicsModel can be wired up and tested end
-    to end — treat it as the stub the rest of the file is built against.
-
-    Contract:
-      * Constructed as ``MLPHead(input_dim, output_dim, hidden_sizes, activation)``.
-      * Maps ``[..., input_dim] -> [..., output_dim]`` preserving leading
-        (batch/time) dims.
-      * ``hidden_sizes == []`` -> a single Linear (no hidden layers).
-    """
-
-    _ACTIVATIONS = {
-        "relu": nn.ReLU,
-        "silu": nn.SiLU,
-        "gelu": nn.GELU,
-        "tanh": nn.Tanh,
-    }
-
-    def __init__(self, input_dim, output_dim, hidden_sizes=None, activation="relu"):
-        super().__init__()
-        if activation not in self._ACTIVATIONS:
-            raise NotImplementedError(f"unsupported activation: {activation!r}")
-        act = self._ACTIVATIONS[activation]
-
-        hidden_sizes = hidden_sizes or []
-        layers = []
-        prev = input_dim
-        for h in hidden_sizes:
-            layers += [nn.Linear(prev, h), act()]
-            prev = h
-        layers.append(nn.Linear(prev, output_dim))  # no activation on Δs output
-        self.net = nn.Sequential(*layers)
-
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-
-    def forward(self, x):
-        return self.net(x)
-
-
-# --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
 @dataclass
@@ -91,8 +41,11 @@ class DynamicsModelConfig:
     # GPT template. `in_features` is overwritten at construction time with the
     # encoder's output width, so its value here is ignored.
     dynamics: GPTConfig
-    head_hidden: list[int] = field(default_factory=list)
-    head_activation: str = "relu"
+    # Δs head. It is just another MLPEncoder over the GPT output, so it reuses
+    # the same config type. `layer_sizes` here are the head's HIDDEN layers; the
+    # final projection to the (data-driven) Δs width is appended automatically
+    # at construction, so an empty config gives a single Linear.
+    head: MLPEncoderConfig = field(default_factory=MLPEncoderConfig)
     history_length: int = 10
     normalize_input: bool = True
     normalize_output: bool = True
@@ -156,12 +109,15 @@ class DynamicsModel(nn.Module):
         core_dim = gpt_cfg.n_embd
 
         # --- Δs head --- #
-        self.head = MLPHead(
-            core_dim,
-            output_dim,
-            hidden_sizes=config.head_hidden,
-            activation=config.head_activation,
+        # The head is a plain MLP, which is exactly what MLPEncoder already is,
+        # so we reuse it rather than duplicate the Linear-stack logic. The head
+        # config carries only the hidden layers; the final projection to the
+        # data-driven Δs width is appended here so it can never be mis-set.
+        head_cfg = replace(
+            config.head, layer_sizes=[*config.head.layer_sizes, output_dim]
         )
+        self.head = MLPEncoder(core_dim, head_cfg)
+        assert self.head.output_dim == output_dim, self.head.output_dim
         self.output_dim = output_dim
 
         self.to(device)
