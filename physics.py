@@ -2,27 +2,27 @@ import mujoco
 import numpy as np
 
 def generate_xml(
+                mass0 : float,
                 mass1 : float,
-                mass2 : float,
+                length0 : float,
                 length1 : float,
-                length2 : float,
-                ground : tuple[float, str], #this needs to be figured out, need to calculate ground in env.reset seperately
+                ground : tuple[float, str],  # (depth in metres, quat "w x y z"); a placeholder — env.reset() patches the floor geom per episode
                 timestep : float,
                 ) -> str:
 
     r = 0.02
+    volume0 = length0 * np.pi * r * r
+    density0 = mass0 / volume0
+
     volume1 = length1 * np.pi * r * r
     density1 = mass1 / volume1
-    
-    volume2 = length2 * np.pi * r * r
-    density2 = mass2 / volume2
 
-    ground_depth, ground_quat = ground #ground_pos = "x y z", ground_quat = "a b c d"
+    ground_depth, ground_quat = ground
 
     # Place the two fixed cameras at the pendulum's mid-height (it hangs from z=0 down
-    # to z=-(length1+length2)) and back them off by a distance that frames the full
+    # to z=-(length0+length1)) and back them off by a distance that frames the full
     # reach. cam0 looks along +Y (front), cam1 looks along +X (side).
-    total_len = length1 + length2
+    total_len = length0 + length1
     cam_z = -total_len / 2.0
     cam_d = 2.5 * total_len + 0.5
     xml = f"""
@@ -45,10 +45,10 @@ def generate_xml(
 
         <body name="link0" pos="0 0 0">
             <joint name="joint0"/>
-            <geom fromto="0 0 0 0 0 {-length1}" density="{density1}" rgba="1 1 0 1"/>
-            <body name="link1" pos="0 0 {-length1}">
+            <geom fromto="0 0 0 0 0 {-length0}" density="{density0}" rgba="1 1 0 1"/>
+            <body name="link1" pos="0 0 {-length0}">
                 <joint name="joint1"/>
-                <geom fromto="0 0 0 0 0 {-length2}" density="{density2}" rgba="1 0 0 1"/>
+                <geom fromto="0 0 0 0 0 {-length1}" density="{density1}" rgba="1 0 0 1"/>
             </body>
         </body>
     </worldbody>
