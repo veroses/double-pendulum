@@ -8,6 +8,12 @@ Usage:
 
     # all 30 shards sequentially:
     python generate_data.py
+
+    # a held-out eval set: separate folder AND a seed offset. Episode seeds are
+    # deterministic (seed_offset + shard*N_TRAJ + traj), so without an offset an
+    # eval shard would be identical to its training counterpart.
+    python generate_data.py --out_dir data_eval --seed-offset 1000000
+    python generate_data.py --out_dir data_eval_noslide --seed-offset 2000000 --no-slide
 """
 
 import argparse
@@ -48,7 +54,8 @@ def _make_env(slide: bool=True, rgb_state: bool=True) -> DoublePendulum:
     )
 
 
-def collect_shard(shard_idx: int, out_dir: str, slide: bool=True) -> None:
+def collect_shard(shard_idx: int, out_dir: str, slide: bool=True,
+                  seed_offset: int=0) -> None:
     env = _make_env(slide)
     os.makedirs(out_dir, exist_ok=True)
     path = os.path.join(out_dir, f"shard_{shard_idx:03d}.h5")
@@ -69,7 +76,8 @@ def collect_shard(shard_idx: int, out_dir: str, slide: bool=True) -> None:
 
             # Unique, deterministic seed per trajectory so shards are reproducible
             # and never overlap. sample_tau() draws from the same seeded RNG.
-            env.reset(seed=shard_idx * N_TRAJ + traj_idx)
+            # seed_offset separates whole datasets (e.g. train vs held-out eval).
+            env.reset(seed=seed_offset + shard_idx * N_TRAJ + traj_idx)
 
             # Record the episode's ground pose — it isn't part of the state vector
             # but is needed to recompute contacts (e.g. for rollout evaluation).
@@ -125,15 +133,20 @@ def main() -> None:
         "--out_dir", type=str, default=OUT_DIR,
         help="Output directory for HDF5 shard files.",
     )
+    parser.add_argument(
+        "--seed-offset", type=int, default=0,
+        help="Added to every episode seed. Use a large distinct offset per dataset "
+             "(e.g. 1000000 for an eval set) so it never repeats training episodes.",
+    )
     args = parser.parse_args()
-    
+
     if args.shard is not None:
         if not (0 <= args.shard < N_SHARDS):
             raise ValueError(f"--shard must be in [0, {N_SHARDS - 1}], got {args.shard}")
-        collect_shard(args.shard, args.out_dir, slide=args.slide)
+        collect_shard(args.shard, args.out_dir, slide=args.slide, seed_offset=args.seed_offset)
     else:
         for i in range(N_SHARDS):
-            collect_shard(i, args.out_dir, slide=args.slide)
+            collect_shard(i, args.out_dir, slide=args.slide, seed_offset=args.seed_offset)
 
 
 if __name__ == "__main__":
