@@ -1,5 +1,8 @@
 import time
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")  # env loop runs off the main thread under the human viewer
+import matplotlib.pyplot as plt
 import mujoco
 from env import DoublePendulum  # adjust if your file/module name differs
 
@@ -79,6 +82,40 @@ def test_3d_motion():
     print(f"3d motion ok | max|y| of link1 = {max_abs_y:.4f} m\n")
 
 
+def test_spawn_and_tau_sampling():
+    """Verify rejection-sampled spawns and exponentially smoothed torque sampling.
+
+    Checks:
+      - with slide=True, no episode ever starts with a link penetrating the floor
+      - sample_tau() stays within the per-axis limits
+      - spin-axis (local z) torques are identically zero
+      - consecutive torques respect the exponential-smoothing step bound
+    """
+    print("=== SPAWN / TAU SAMPLING TEST ===")
+    env = DoublePendulum(mass0=1.0, mass1=1.0, length0=0.3, length1=0.4, slide=True)
+
+    for i in range(100):
+        env.reset(seed=i)
+        assert not env._spawn_penetrating(), f"seed {i}: spawned inside the ground"
+
+    env.reset(seed=0)
+    prev = env.torques.copy()
+    max_step = (1.0 - env.tau_alpha) * 2.0 * env.tau_limit + 1e-12
+    for t in range(200):
+        tau = env.sample_tau()
+        assert tau.shape == (6,)
+        assert np.all(np.abs(tau) <= env.tau_limit + 1e-12), f"step {t}: tau out of bounds"
+        assert tau[2] == 0.0 and tau[5] == 0.0, f"step {t}: spin-axis torque non-zero"
+        assert np.all(np.abs(tau - prev) <= max_step), f"step {t}: tau jump too large"
+        _, _, terminated, _, _ = env.step(tau)
+        if terminated:
+            env.reset(seed=1000 + t)
+        prev = env.torques.copy()
+
+    env.close()
+    print("spawn/tau ok | 100 penetration-free spawns, 200 smooth bounded torques\n")
+
+
 def smoke_rgb_array():
     """Verify rgb_array mode returns one frame per camera and stepping stays finite."""
     print("=== RGB_ARRAY SMOKE TEST ===")
@@ -109,7 +146,7 @@ def smoke_rgb_array():
     print(f"render ok | {len(frames)} frames, each {frames[0].shape} {frames[0].dtype} | cam diff={diff:.1f}")
 
     for i in range(50):
-        action = env.action_space.sample()
+        action = env.sample_tau()
         obs, reward, terminated, truncated, info = env.step(action)
 
         if not np.isfinite(obs).all():
@@ -170,6 +207,7 @@ def smoke_human():
         timestep=0.001,
         slide=True,
         render_mode="human",
+        rgb_state=True,
     )
 
     n_episodes = 3
@@ -183,6 +221,20 @@ def smoke_human():
         ground_quat  = env.model.geom_quat[floor_id]
         tilt_deg     = float(np.degrees(2 * np.arccos(np.clip(ground_quat[0], -1, 1))))
         print(f"episode {ep+1}/{n_episodes} | ground depth={ground_depth:.3f} m  tilt={tilt_deg:.1f}°")
+
+        cams = env.CAMERA_NAMES
+        fig, axes = plt.subplots(1, len(cams), figsize=(4 * len(cams), 4), squeeze=False)
+        fig.suptitle(f"episode {ep+1}/{n_episodes} — rgb_state frames")
+        for ax, cam in zip(axes[0], cams):
+            frame = info[f"rgb_{cam}"]
+            ax.imshow(frame)
+            ax.set_title(f"rgb_{cam} {frame.shape}")
+            ax.axis("off")
+        plt.tight_layout()
+        out_path = f"rgb_state_ep{ep+1}.png"
+        fig.savefig(out_path)
+        plt.close(fig)
+        print(f"  saved rgb_state frames -> {out_path}")
 
         t_end = time.time() + episode_duration
         steps = 0
@@ -203,6 +255,7 @@ def smoke_human():
 if __name__ == "__main__":
     test_spaces_and_dims()
     test_3d_motion()
+    test_spawn_and_tau_sampling()
     smoke_rgb_array()
     test_rgb_state()
     smoke_human()
