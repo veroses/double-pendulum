@@ -32,14 +32,16 @@ ACTION_DIM = 6
 OUT_DIR    = "data"
 
 
-def _make_env(slide: bool=True) -> DoublePendulum:
+def _make_env(slide: bool=True, rgb_state: bool=True) -> DoublePendulum:
     # timestep defaults to 1/60 → mujoco model dt = (1/60)/4 = 1/240 s (240 Hz)
+    # rgb_state=False skips the per-step camera renders (used by eval.py when
+    # evaluating the state modality, which never looks at pixels).
     return DoublePendulum(
         mass0=1.0,
         mass1=1.0,
         length0=0.3,
         length1=0.4,
-        rgb_state=True,
+        rgb_state=rgb_state,
         render_width=256,
         render_height=256,
         slide=slide
@@ -65,11 +67,28 @@ def collect_shard(shard_idx: int, out_dir: str, slide: bool=True) -> None:
             buf_cam0      = np.zeros((N_STEPS, TARGET_H, TARGET_W, 3), dtype=np.uint8)
             buf_cam1      = np.zeros((N_STEPS, TARGET_H, TARGET_W, 3), dtype=np.uint8)
 
-            env.reset()
+            # Unique, deterministic seed per trajectory so shards are reproducible
+            # and never overlap. sample_tau() draws from the same seeded RNG.
+            env.reset(seed=shard_idx * N_TRAJ + traj_idx)
 
+            # Record the episode's ground pose — it isn't part of the state vector
+            # but is needed to recompute contacts (e.g. for rollout evaluation).
+            floor_id = env.model.geom("floor").id
+            ground_pos  = env.model.geom_pos[floor_id].copy()
+            ground_quat = env.model.geom_quat[floor_id].copy()
+
+            steps_taken = 0
             for step in range(N_STEPS):
-                action = env.action_space.sample()
+                # Exponentially smoothed torque (see DoublePendulum.sample_tau),
+                # not white-noise uniform sampling.
+                action = env.sample_tau()
                 obs, _reward, terminated, _truncated, info = env.step(action)
+
+                if terminated:
+                    # The sim blew up during this step, so the state is non-finite —
+                    # don't write it. Rows from here on stay zero-padded; loaders
+                    # recover the valid length from the obs quaternion norm.
+                    break
 
                 buf_state[step]     = info["state"]
                 buf_obs[step]       = obs
@@ -78,11 +97,12 @@ def collect_shard(shard_idx: int, out_dir: str, slide: bool=True) -> None:
                 buf_world_pos[step] = info["world_pos"]
                 buf_cam0[step]      = downsample_rgb(info["rgb_cam0"], TARGET_H, TARGET_W)
                 buf_cam1[step]      = downsample_rgb(info["rgb_cam1"], TARGET_H, TARGET_W)
-
-                if terminated:
-                    break
+                steps_taken += 1
 
             grp = f.create_group(f"traj_{traj_idx:04d}")
+            grp.attrs["steps_taken"] = steps_taken
+            grp.attrs["ground_pos"]  = ground_pos
+            grp.attrs["ground_quat"] = ground_quat
             grp.create_dataset("state",     data=buf_state,     **gz)
             grp.create_dataset("obs",       data=buf_obs,       **gz)
             grp.create_dataset("actions",   data=buf_actions,   **gz)
