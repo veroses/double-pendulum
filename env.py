@@ -31,7 +31,8 @@ class DoublePendulum(gym.Env):
 
     Action space (shape 6):
         [τ0_x, τ0_y, τ0_z, τ1_x, τ1_y, τ1_z] (N·m) — torque about each joint's three
-        local axes, clipped to ±max_tau.
+        local axes, clipped per-axis to ±tau_limit (±max_tau on the bending x/y axes,
+        ±max_tau_spin — 0 by default — on each link's longitudinal z/spin axis).
 
     The richer per-step state needed for NeRD training is returned in the `info` dict
     from both reset() and step() — see _get_info() for its structure.
@@ -92,7 +93,21 @@ class DoublePendulum(gym.Env):
 
         self.slide = slide
         self.rgb_state = rgb_state
-        self.max_tau = 2.0  # N·m — symmetric torque limit applied to every actuator
+
+        # Torque limits (N·m). Bending axes (each joint's local x/y) get max_tau.
+        # The spin axis (local z, along the link's own long axis) gets max_tau_spin,
+        # which defaults to 0: a thin cylinder's axial inertia is ~½mr² ≈ 2e-4 kg·m²,
+        # so even small axial torques produce ~1e4 rad/s² and blow up the integrator,
+        # and axial spin of a symmetric cylinder is invisible to the cameras anyway.
+        self.max_tau = 2.0
+        self.max_tau_spin = 0.0
+        self.tau_limit = np.array([self.max_tau, self.max_tau, self.max_tau_spin],
+                                  dtype=np.float64)
+        self.tau_limit = np.tile(self.tau_limit, 2)  # [τ0_xyz, τ1_xyz]
+
+        # Exponential-smoothing factor for sample_tau(): closer to 1 → smoother,
+        # more temporally correlated torque signals.
+        self.tau_alpha = 0.9
 
         # Observation = raw qpos (8 quaternion components in [-1, 1]) followed by raw
         # qvel (6 angular velocities). Quaternion bounds are unit-norm components.
@@ -103,9 +118,8 @@ class DoublePendulum(gym.Env):
             dtype=np.float64,
         )
         self.action_space = gym.spaces.Box(
-            low=-self.max_tau,
-            high=self.max_tau,
-            shape=(6,),
+            low=-self.tau_limit,
+            high=self.tau_limit,
             dtype=np.float64,
         )
 
@@ -145,6 +159,11 @@ class DoublePendulum(gym.Env):
         # Number of bins each link is divided into for contact localisation.
         # Higher K → finer spatial resolution of where contact occurs along the link.
         self.segments_per_link = 8
+
+        # reset() redraws (pendulum pose, ground pose) until the links don't start
+        # inside the floor. This caps the redraws; acceptance is well above 50%, so
+        # hitting the cap indicates a bug rather than bad luck.
+        self.max_spawn_resamples = 100
 
 
     def _get_obs(self) -> np.ndarray:
@@ -337,6 +356,24 @@ class DoublePendulum(gym.Env):
         return info
 
 
+    def sample_tau(self) -> np.ndarray:
+        """Sample the next exploration torque by exponentially smoothing the last one.
+
+            τ_t = α · τ_{t-1} + (1 − α) · u_t,   u_t ~ Uniform(−tau_limit, +tau_limit)
+
+        Unlike white-noise uniform sampling (action_space.sample()), consecutive
+        torques stay temporally correlated, giving smooth control signals with a
+        time constant of ~dt/(1−α) seconds. Values stay inside ±tau_limit by
+        convexity, and spin-axis components stay at 0 when max_tau_spin == 0.
+        Draws from self.np_random, so rollouts are reproducible from reset(seed=...).
+
+        Returns:
+            np.ndarray of shape (6,): the torque to pass to step().
+        """
+        u = self.np_random.uniform(-self.tau_limit, self.tau_limit)
+        return self.tau_alpha * self.torques + (1.0 - self.tau_alpha) * u
+
+
     def _sync_state(self) -> None:
         """Copy the current MuJoCo qpos/qvel into self.state.
 
@@ -353,8 +390,9 @@ class DoublePendulum(gym.Env):
 
         Depth range:
             The ground z-position is sampled uniformly between:
-              - deepest : 1 m below the tip of link1  →  z = -(length0 + length1 + 1)
-              - shallowest : halfway up link0          →  z = -length0 / 2
+              - deepest : the tip of the fully extended pendulum (minus eps)
+                          →  z = -(length0 + length1 - eps)
+              - shallowest : halfway up link0  →  z = -length0 / 2
 
         Tilt range:
             The ground normal can tilt up to 30° away from vertical (+Z) in any
@@ -405,6 +443,12 @@ class DoublePendulum(gym.Env):
         This means the viewer window (if open) stays alive across episodes without
         needing to be closed or reloaded.
 
+        Initial conditions are rejection-sampled: the (pendulum pose, ground pose)
+        pair is redrawn until no link starts penetrating the floor, so episodes never
+        begin with the pendulum inside the ground. This truncates the joint spawn
+        distribution to the physically valid region; eval data generated through
+        this same reset() sees the identical distribution.
+
         Args:
             seed: RNG seed for reproducible episodes. Passed to the Gymnasium base
                   class which initialises self.np_random.
@@ -415,32 +459,21 @@ class DoublePendulum(gym.Env):
         Returns:
             observation (np.ndarray): Initial observation of shape (14,).
             info (dict): Initial NeRD state dict from _get_info().
+
+        Raises:
+            RuntimeError: If no penetration-free spawn is found within
+                          max_spawn_resamples draws (indicates a bug, not bad luck).
         """
         super().reset(seed=seed)
 
-        # Random initial joint orientations, uniform over rotations: sampling 4
-        # i.i.d. Gaussians and normalising gives a uniform point on the unit
-        # quaternion sphere (and hence a uniform random rotation).
-        q0 = self.np_random.normal(size=4); q0 /= np.linalg.norm(q0)
-        q1 = self.np_random.normal(size=4); q1 /= np.linalg.norm(q1)
-        quats = np.concatenate([q0, q1])
-
-        # Random initial joint angular velocities (rad/s), per local axis.
-        angvels = self.np_random.uniform(-4*np.pi, 4*np.pi, size=6)
-
-        self.state[:8] = quats
-        self.state[8:] = angvels
-
-        self.torques = self.np_random.uniform(-self.max_tau, self.max_tau, size=6)
-
-        ground_depth, ground_quat = self._sample_ground(slide=self.slide)
-
         if self.model is None:
             # First reset: build model from XML and cache body ids + joint addresses.
-            ground_quat_str = " ".join(str(v) for v in ground_quat)
-            model_timestep  = self.dt / self.substeps
+            # The ground pose baked into the XML is a placeholder — every episode
+            # (including this one) patches the floor geom in the loop below.
+            model_timestep = self.dt / self.substeps
+            placeholder_ground = (-(self.length0 + self.length1 + 0.3), "1 0 0 0")
             xml = generate_xml(self.mass0, self.mass1, self.length0, self.length1,
-                               (ground_depth, ground_quat_str), model_timestep)
+                               placeholder_ground, model_timestep)
             self.model = mujoco.MjModel.from_xml_string(xml)
             self.data  = mujoco.MjData(self.model)
             self.body_ids = {
@@ -451,28 +484,71 @@ class DoublePendulum(gym.Env):
                              int(self.model.joint("joint1").qposadr[0])]
             self.jnt_vadr = [int(self.model.joint("joint0").dofadr[0]),
                              int(self.model.joint("joint1").dofadr[0])]
-        else:
-            # Subsequent resets: patch ground geometry in-place so the viewer
-            # window doesn't need to close/reopen.
-            floor_id = self.model.geom("floor").id
+
+        floor_id = self.model.geom("floor").id
+
+        for _ in range(self.max_spawn_resamples):
+            # Random initial joint orientations, uniform over rotations: sampling 4
+            # i.i.d. Gaussians and normalising gives a uniform point on the unit
+            # quaternion sphere (and hence a uniform random rotation).
+            q0 = self.np_random.normal(size=4); q0 /= np.linalg.norm(q0)
+            q1 = self.np_random.normal(size=4); q1 /= np.linalg.norm(q1)
+            quats = np.concatenate([q0, q1])
+
+            # Random initial joint angular velocities (rad/s), per local axis.
+            angvels = self.np_random.uniform(-4*np.pi, 4*np.pi, size=6)
+
+            ground_depth, ground_quat = self._sample_ground(slide=self.slide)
+
+            # Patch the floor geom in-place so the viewer window (if open) doesn't
+            # need to close/reopen, then reset data (zeros qpos/qvel, clears contacts).
             self.model.geom_pos[floor_id]  = [0.0, 0.0, ground_depth]
             self.model.geom_quat[floor_id] = ground_quat
-            # Reset all of data back to defaults (zeros qpos/qvel, clears contacts etc.)
             mujoco.mj_resetData(self.model, self.data)
 
-        self.data.qpos[:] = quats
-        self.data.qvel[:] = angvels
+            self.data.qpos[:] = quats
+            self.data.qvel[:] = angvels
+
+            # mj_forward propagates the state through the kinematics/dynamics without
+            # advancing time, so xpos/xmat/contacts are all valid for the check below
+            # (and for _get_info once a sample is accepted).
+            mujoco.mj_forward(self.model, self.data)
+
+            if not self._spawn_penetrating():
+                break
+        else:
+            raise RuntimeError(
+                f"reset() failed to find a penetration-free spawn in "
+                f"{self.max_spawn_resamples} attempts — check ground/pendulum geometry."
+            )
+
+        self.state[:8] = quats
+        self.state[8:] = angvels
+
+        self.torques = self.np_random.uniform(-self.tau_limit, self.tau_limit)
         self.data.ctrl[:] = self.torques
 
-        # mj_forward propagates the initial state through the kinematics/dynamics
-        # without advancing time, so xpos/xmat/contacts are all valid after this call.
-        mujoco.mj_forward(self.model, self.data)
         self._sync_state()
 
         observation = self._get_obs()
         info = self._get_info()
 
         return observation, info
+
+
+    def _spawn_penetrating(self) -> bool:
+        """Return True if any floor–link contact is currently penetrating.
+
+        Assumes mj_forward (or mj_step) has already run so the contact list is
+        current. Contacts with dist >= 0 (near-contact within the collision margin)
+        are fine — only actual interpenetration (dist < 0) counts.
+        """
+        floor = self.model.geom("floor").id
+        for i in range(self.data.ncon):
+            contact = self.data.contact[i]
+            if contact.dist < 0.0 and floor in contact.geom:
+                return True
+        return False
 
 
     def step(self, action):
@@ -495,7 +571,7 @@ class DoublePendulum(gym.Env):
             info (dict): NeRD state dict from _get_info().
         """
         action = np.asarray(action, dtype=np.float64).reshape(-1)
-        taus = np.clip(action, -self.max_tau, self.max_tau)
+        taus = np.clip(action, -self.tau_limit, self.tau_limit)
 
         self.torques[:] = taus
         self.data.ctrl[:] = taus
