@@ -10,3 +10,10 @@ __pycache__/
 .uv/
 *.log
 .DS_Store
+
+# experiment artifacts
+data/
+runs/
+eval_out/
+MUJOCO_LOG.TXT
+rgb_state_ep*.png
