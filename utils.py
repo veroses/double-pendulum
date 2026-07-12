@@ -20,7 +20,9 @@ def downsample_rgb(img: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
     """
     t = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).float()  # (1, 3, N, M)
     t = F.interpolate(t, size=(out_h, out_w), mode="area")            # (1, 3, out_h, out_w)
-    return t.squeeze(0).permute(1, 2, 0).byte().numpy()               # (out_h, out_w, 3)
+    # round() before the uint8 cast: .byte() truncates toward zero, which would
+    # bias every averaged pixel darker by ~0.5 intensity levels.
+    return t.squeeze(0).permute(1, 2, 0).round().byte().numpy()       # (out_h, out_w, 3)
 
 
 def rotation_to_6d(R: np.ndarray) -> np.ndarray:
