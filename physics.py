@@ -33,7 +33,11 @@ def generate_xml(
 
     <default>
         <joint type="ball" damping="0.005"/>
-        <geom type="cylinder" size="{r}" friction="0.1 0.005 0.0001"/>
+        <!-- margin=gap=0.08: contacts are DETECTED within 8 cm (so the NeRD
+             contact bins see near-contacts approaching, matching env.xi) but
+             only produce force below margin - gap = 0, i.e. actual touch —
+             the dynamics are identical to margin=0. -->
+        <geom type="cylinder" size="{r}" friction="0.1 0.005 0.0001" margin="0.08" gap="0.08"/>
     </default>
 
     <worldbody>
@@ -41,7 +45,7 @@ def generate_xml(
         <camera name="cam0" pos="0 {-cam_d} {cam_z}" xyaxes="1 0 0 0 0 1"/>
         <camera name="cam1" pos="{-cam_d} 0 {cam_z}" xyaxes="0 -1 0 0 0 1"/>
 
-            <geom name="floor" type="plane" pos="0 0 {ground_depth}" size="1.0 1.0 0.1" quat="{ground_quat}" friction="0.1 0.005 0.0001" rgba="0.9 0.9 0.9 1"/>
+            <geom name="floor" type="plane" pos="0 0 {ground_depth}" size="1.0 1.0 0.1" quat="{ground_quat}" friction="0.1 0.005 0.0001" margin="0.08" gap="0.08" rgba="0.9 0.9 0.9 1"/>
 
         <body name="link0" pos="0 0 0">
             <joint name="joint0"/>
