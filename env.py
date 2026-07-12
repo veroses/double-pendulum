@@ -198,8 +198,9 @@ class DoublePendulum(gym.Env):
 
             Each bin stores 10 floats:
                 [p0 (3,), p1 (3,), normal (3,), dist (1,)]
-            where p0 is the point on the link surface, p1 the point on the floor, and
-            normal points from floor toward the link — all in link0's body frame.
+            where p0 is the point on the floor surface, p1 the point on the link
+            surface, and normal points from the floor toward the link — all
+            expressed in the contacted link's own body frame.
 
             The filled mask (2*K booleans cast to float32) indicates which bins have
             a valid contact.
@@ -273,52 +274,49 @@ class DoublePendulum(gym.Env):
             if distance > self.xi:
                 continue
 
-            # MuJoCo contact normal points from geom1 toward geom0.
+            # MuJoCo's contact normal is frame[:3], pointing from geom[0] toward
+            # geom[1] (verified empirically on this model). With a plane floor,
+            # MuJoCo canonicalises the pair order by ascending geom type, and
+            # plane is the smallest type — so today g0 is always the floor and
+            # the elif branch below is defensive (it goes live only if the floor
+            # ever becomes a box/mesh platform). Both branches normalise to the
+            # same stored convention: normal points floor → link,
+            # p0 = point on the floor surface, p1 = point on the link surface.
             normal = contact.frame[:3]
             g0, g1 = contact.geom
             b0 = self.model.geom_bodyid[g0]
             b1 = self.model.geom_bodyid[g1]
 
-            # Reconstruct the surface contact points on each geometry.
-            # p0 is the point on the non-floor geom (the link), p1 on the floor.
             if g0 == floor:
-                # floor is geom0 → normal points from floor toward link
-                p0 = contact.pos - 0.5 * distance * normal  # point on floor surface
-                p1 = contact.pos + 0.5 * distance * normal  # point on link surface
-
-                if b1 == body:    # contact is with link0
-                    p_body  = worldf_R.T @ (p1 - worldf_pos)
-                    R_contact, pos_contact = worldf_R, worldf_pos
-                    z = -p_body[2]
-                    bin_idx = int(np.clip((z * K) / self.length0, 0.0, K - 1))
-                elif b1 == link1: # contact is with link1
-                    p_body  = worldf_R1.T @ (p1 - worldf_pos1)
-                    R_contact, pos_contact = worldf_R1, worldf_pos1
-                    z = -p_body[2]
-                    bin_idx = int(np.clip((z * K) / self.length1, 0.0, K - 1) + K)
-                else:
-                    continue
-
+                # normal already points floor (geom0) → link (geom1)
+                link_body = b1
             elif g1 == floor:
-                # floor is geom1 → normal points from link toward floor, so flip
-                p0 = contact.pos + 0.5 * distance * normal  # point on link surface
-                p1 = contact.pos - 0.5 * distance * normal  # point on floor surface
-
-                if b0 == body:    # contact is with link0
-                    p_body  = worldf_R.T @ (p0 - worldf_pos)
-                    R_contact, pos_contact = worldf_R, worldf_pos
-                    z = -p_body[2]
-                    bin_idx = int(np.clip((z * K) / self.length0, 0.0, K - 1))
-                elif b0 == link1: # contact is with link1
-                    p_body  = worldf_R1.T @ (p0 - worldf_pos1)
-                    R_contact, pos_contact = worldf_R1, worldf_pos1
-                    z = -p_body[2]
-                    bin_idx = int(np.clip((z * K) / self.length1, 0.0, K - 1) + K)
-                else:
-                    continue
-
+                # normal points link (geom0) → floor (geom1): flip it so the
+                # convention below is identical in both branches
+                normal = -normal
+                link_body = b0
             else:
                 continue  # neither geom is the floor — skip
+
+            # Surface points from the midpoint: contact.pos sits halfway between
+            # the two surfaces along the normal, dist apart (negative when
+            # penetrating), with the link on the +normal side.
+            p0 = contact.pos - 0.5 * distance * normal  # point on floor surface
+            p1 = contact.pos + 0.5 * distance * normal  # point on link surface
+
+            # Bin along the contacted link using the link-surface point p1.
+            if link_body == body:     # contact is with link0
+                R_contact, pos_contact, length = worldf_R, worldf_pos, self.length0
+                bin_offset = 0
+            elif link_body == link1:  # contact is with link1
+                R_contact, pos_contact, length = worldf_R1, worldf_pos1, self.length1
+                bin_offset = K
+            else:
+                continue
+
+            p_body = R_contact.T @ (p1 - pos_contact)
+            z = -p_body[2]
+            bin_idx = int(np.clip((z * K) / length, 0.0, K - 1) + bin_offset)
 
             # Express the contact geometry in the relevant link's body frame.
             basef_p0     = R_contact.T @ (p0 - pos_contact)
@@ -440,8 +438,15 @@ class DoublePendulum(gym.Env):
         On the first call the MuJoCo model is built from XML. On every subsequent
         call the same model/data objects are reused — only the ground geom's position
         and quaternion are patched in-place, and data is reset with mj_resetData.
-        This means the viewer window (if open) stays alive across episodes without
-        needing to be closed or reloaded.
+        This means the viewer window (if open) and the offscreen renderer stay
+        alive across episodes.
+
+        In-place quat patching only works because the first build clears the
+        floor's ``geom_sameframe`` flag (see the comment at the build site): the
+        model compiler notices when a geom's orientation coincides with its
+        body's frame and bakes a fast path that copies the body rotation every
+        step, silently ignoring runtime writes to model.geom_quat. (Position is
+        unaffected — it compiles non-coincident and stays on the general path.)
 
         Initial conditions are rejection-sampled: the (pendulum pose, ground pose)
         pair is redrawn until no link starts penetrating the floor, so episodes never
@@ -452,9 +457,12 @@ class DoublePendulum(gym.Env):
         Args:
             seed: RNG seed for reproducible episodes. Passed to the Gymnasium base
                   class which initialises self.np_random.
-            options: Reserved for overriding specific initial conditions in testing.
-                     Intended format (not yet implemented):
-                     {"ground": (depth, quat), "quats": (q0, q1), "angvels": (w0, w1)}
+            options: Optional overrides for evaluation/testing.
+                     {"ground": (depth: float, quat: array-like (4,))} pins the floor
+                     to a fixed pose instead of sampling one — e.g. to replicate NeRD's
+                     fixed-ground-configuration eval protocol (§5.2) — while the
+                     pendulum's initial orientation/velocity is still drawn randomly
+                     (and still rejection-sampled against that fixed ground).
 
         Returns:
             observation (np.ndarray): Initial observation of shape (14,).
@@ -485,7 +493,18 @@ class DoublePendulum(gym.Env):
             self.jnt_vadr = [int(self.model.joint("joint0").dofadr[0]),
                              int(self.model.joint("joint1").dofadr[0])]
 
+            # CRITICAL: the placeholder floor compiles with an identity quat, so the
+            # compiler sets geom_sameframe to "orientation same as body" and
+            # mj_kinematics thereafter COPIES the worldbody rotation instead of
+            # reading geom_quat — runtime tilt patches would be silently ignored
+            # (while depth patches would still work, making the bug invisible).
+            # Clearing the flag forces the general pose computation, which always
+            # honours the current geom_pos AND geom_quat.
+            floor_id = self.model.geom("floor").id
+            self.model.geom_sameframe[floor_id] = 0  # mjSF_NONE
+
         floor_id = self.model.geom("floor").id
+        forced_ground = (options or {}).get("ground")
 
         for _ in range(self.max_spawn_resamples):
             # Random initial joint orientations, uniform over rotations: sampling 4
@@ -498,7 +517,10 @@ class DoublePendulum(gym.Env):
             # Random initial joint angular velocities (rad/s), per local axis.
             angvels = self.np_random.uniform(-4*np.pi, 4*np.pi, size=6)
 
-            ground_depth, ground_quat = self._sample_ground(slide=self.slide)
+            if forced_ground is not None:
+                ground_depth, ground_quat = forced_ground
+            else:
+                ground_depth, ground_quat = self._sample_ground(slide=self.slide)
 
             # Patch the floor geom in-place so the viewer window (if open) doesn't
             # need to close/reopen, then reset data (zeros qpos/qvel, clears contacts).
