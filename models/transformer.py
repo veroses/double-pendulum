@@ -118,7 +118,7 @@ class Block(nn.Module):
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    in_features: int = 50304 # GPT-2 in_features of 50257, padded up to nearest multiple of 64 for efficiency
+    in_features: int = 50304 # placeholder — DynamicsModel overwrites this with the encoder's output width
     n_layer: int = 12
     n_head: int = 12
     n_embd: int = 768
@@ -134,7 +134,7 @@ class GPT(nn.Module):
         self.config = config
 
         self.transformer = nn.ModuleDict(dict(
-            wte = nn.Linear(config.in_features, config.n_embd),
+            wte = nn.Linear(config.in_features, config.n_embd, bias=config.bias),
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
@@ -161,8 +161,8 @@ class GPT(nn.Module):
         """
         Return the number of parameters in the model.
         For non-embedding count (default), the position embeddings get subtracted.
-        The token embeddings would too, except due to the parameter sharing these
-        params are actually used as weights in the final layer, so we include them.
+        wte is a Linear input projection here (not a tied token embedding), so it
+        always counts as regular weights.
         """
         n_params = sum(p.numel() for p in self.parameters())
         if non_embedding:
