@@ -29,6 +29,17 @@ Two evaluation modes:
    shards). Add --holdout when --data-dir is a dedicated eval set (generated
    with its own --seed-offset) to score every trajectory in the directory.
 
+--nerd-grounds runs the closest direct comparison to NeRD's own §5.2 double-
+pendulum benchmark: passive (zero-torque) rollout across a fixed sweep of
+seven ground configurations (one contact-free baseline + a shallow/mid/deep x
+flat/tilted sweep), reporting the same metric they report — temporally
+averaged joint-angle error in radians, one row per config (their Table 3).
+This differs from --passive (which pools continuously random grounds into one
+number) by holding the ground fixed within each config so results are legible
+as a per-config table. Note: NeRD's own numeric ground configs aren't public,
+and their pendulum is planar/2-DOF-per-joint vs this env's 3D ball joints, so
+treat this as "closest attainable comparison," not an apples-to-apples replay.
+
 Both checkpoint schemas are supported: train.py's ckpt_best.pt / ckpt_last.pt
 and the train.ipynb Trainer's best_model.pt / final_model.pt / model_epochN.pt.
 
@@ -37,6 +48,7 @@ Usage:
     python eval.py --ckpt runs/state_run/ckpt_best.pt --episodes 50 --no-slide
     python eval.py --ckpt runs/vision_run/best_model.pt --episodes 10
     python eval.py --ckpt runs/state_run/ckpt_best.pt --use-shards --data-dir data
+    python eval.py --ckpt runs/state_run/ckpt_best.pt --nerd-grounds --episodes 50
 
 Outputs (under --out-dir, default eval_out/<ckpt parent dir name>/):
     metrics.json        — all summary numbers
@@ -124,8 +136,18 @@ def load_checkpoint(path: str, device: str):
     model = build_model(modality, history, hp, device)
     model.load_state_dict(ck["model"])
 
-    input_rms = {k: RunningMeanStd.from_dict(v) for k, v in ck["input_rms"].items()}
-    output_rms = RunningMeanStd.from_dict(ck["output_rms"])
+    # A checkpoint trained without fitted stats (train.ipynb with
+    # compute_dataset_statistics=False) stores output_rms=None / input_rms={}.
+    # Such a model ran on raw, unscaled values during training, so identity
+    # normalisers reproduce its training-time behaviour exactly.
+    input_rms = {k: RunningMeanStd.from_dict(v) for k, v in (ck["input_rms"] or {}).items()}
+    if ck["output_rms"] is None:
+        print("WARNING: checkpoint has no fitted normalisation stats "
+              "(trained with compute_dataset_statistics=False?) — using identity "
+              "normalisers; norm_mse is then just raw MSE.")
+        output_rms = RunningMeanStd(torch.zeros(18), torch.ones(18))
+    else:
+        output_rms = RunningMeanStd.from_dict(ck["output_rms"])
     model.set_input_rms(input_rms)
     model.set_output_rms(output_rms)
     model.eval()
@@ -135,14 +157,24 @@ def load_checkpoint(path: str, device: str):
 # --------------------------------------------------------------------------- #
 # Live episode collection
 # --------------------------------------------------------------------------- #
-def collect_episode(env, seed: int, n_steps: int, want_frames: bool) -> dict:
+def collect_episode(env, seed: int, n_steps: int, want_frames: bool,
+                    passive: bool = False, ground: tuple | None = None) -> dict:
     """Roll out one full episode exactly like generate_data.collect_shard.
+
+    ``passive=True`` applies zero torque throughout — NeRD's §5.2 double-pendulum
+    protocol (passive motion, random initial states and grounds).
+
+    ``ground``, if given, is an (depth, quat) pair pinning the floor pose for this
+    episode (see DoublePendulum.reset's ``options["ground"]``) — used to replicate
+    NeRD's fixed-ground-configuration eval (Table 3) instead of a random ground per
+    episode. The pendulum's own initial pose/velocity is still drawn randomly.
 
     Retries with a perturbed seed on the (now rare) simulation blow-up so every
     returned episode has the full n_steps transitions.
     """
+    options = {"ground": ground} if ground is not None else None
     for attempt in range(20):
-        env.reset(seed=seed + attempt * 1_000_003)
+        env.reset(seed=seed + attempt * 1_000_003, options=options)
         floor_id = env.model.geom("floor").id
         ground_pos = env.model.geom_pos[floor_id].copy()
         ground_quat = env.model.geom_quat[floor_id].copy()
@@ -150,7 +182,7 @@ def collect_episode(env, seed: int, n_steps: int, want_frames: bool) -> dict:
         states, actions, frames = [], [], []
         ok = True
         for _ in range(n_steps):
-            action = env.sample_tau()
+            action = np.zeros(6) if passive else env.sample_tau()
             _obs, _r, terminated, _tr, info = env.step(action)
             if terminated:
                 ok = False
@@ -383,6 +415,17 @@ def summarise_rollout(all_errs: list[dict], all_base: list[dict]) -> dict:
                 "baseline": float(curves[k]["base_mean"][h - 1])} for k in ERR_KEYS}
         for h in key_h
     }
+
+    # NeRD-style summary (§5.2 / Table 3 of the paper): temporally averaged
+    # joint rotation error over the whole rollout, in radians. Their double
+    # pendulum is planar/passive so the numbers aren't strictly comparable,
+    # but this is the closest like-for-like quantity.
+    out["temporal_avg_rad"] = {
+        "rot0": float(np.radians(curves["rot0_deg"]["model_mean"]).mean()),
+        "rot1": float(np.radians(curves["rot1_deg"]["model_mean"]).mean()),
+        "rot0_baseline": float(np.radians(curves["rot0_deg"]["base_mean"]).mean()),
+        "rot1_baseline": float(np.radians(curves["rot1_deg"]["base_mean"]).mean()),
+    }
     return out
 
 
@@ -410,6 +453,80 @@ def plot_rollout(summary: dict, path: str) -> None:
     fig.tight_layout()
     fig.savefig(path, dpi=120)
     plt.close(fig)
+
+
+# --------------------------------------------------------------------------- #
+# NeRD §5.2 ground-configuration sweep (Table 3 analogue)
+# --------------------------------------------------------------------------- #
+def build_ground_presets(length0: float, length1: float) -> dict:
+    """Seven fixed ground configs — one contact-free baseline plus a
+    shallow/mid/deep x flat/tilted sweep across the env's valid depth/tilt
+    range — analogous to NeRD's no-contact + 6-config §5.2 protocol. The
+    depth/tilt formula matches DoublePendulum._sample_ground's own convention
+    (azimuth phi=0) so "tilted" here is a config _sample_ground could draw.
+
+    NeRD's own numeric configs aren't published, so this is a matched-in-spirit
+    sweep (light sliding contact near "shallow" through near-immediate
+    collision near "deep"), not a byte-for-byte replication.
+    """
+    eps = 1e-3
+    z_min = -(length0 + length1 - eps)   # deepest: tip of the extended pendulum
+    z_max = -length0 / 2.0                # shallowest: halfway up link0
+    z_mid = (z_min + z_max) / 2.0
+    no_contact_depth = -(length0 + length1 + 0.3)
+    flat = np.array([1.0, 0.0, 0.0, 0.0])
+
+    def tilted(deg: float) -> np.ndarray:
+        tilt = np.radians(deg)
+        w, s = np.cos(tilt / 2), np.sin(tilt / 2)
+        return np.array([w, 0.0, s, 0.0])  # matches _sample_ground's phi=0 axis
+
+    return {
+        "no_contact":    (no_contact_depth, flat),
+        "shallow_flat":  (z_max, flat),
+        "shallow_tilted": (z_max, tilted(25.0)),
+        "mid_flat":      (z_mid, flat),
+        "mid_tilted":    (z_mid, tilted(25.0)),
+        "deep_flat":     (z_min, flat),
+        "deep_tilted":   (z_min, tilted(25.0)),
+    }
+
+
+def nerd_grounds_eval(model, modality, history, device, args) -> dict:
+    """Passive rollout across the seven fixed ground configs; reports
+    temporally averaged joint error (rad) per config, model vs baseline —
+    the same shape as NeRD's Table 3."""
+    n_episodes = args.ground_episodes if args.ground_episodes is not None else args.episodes
+    if n_episodes <= 0:
+        raise SystemExit("--nerd-grounds needs episodes: set --ground-episodes "
+                         "(or --episodes, which it defaults to)")
+    want_frames = modality == "vision"
+    env = _make_env(slide=True, rgb_state=want_frames)
+    shadow = ShadowSim(slide=True, want_frames=want_frames)
+    presets = build_ground_presets(env.length0, env.length1)
+
+    table = {}
+    print(f"{'config':>16} | {'joint0 (rad)':>20} | {'joint1 (rad)':>20}")
+    print(f"{'':>16} | {'model':>9} {'baseline':>10} | {'model':>9} {'baseline':>10}")
+    for name, ground in presets.items():
+        episodes = [collect_episode(env, args.seed + i, args.steps, want_frames,
+                                    passive=True, ground=ground)
+                    for i in range(n_episodes)]
+        all_errs, all_base = [], []
+        for ep in episodes:
+            e, b = rollout_episode(model, ep, history, modality, shadow, device)
+            all_errs.append(e)
+            all_base.append(b)
+        ta = summarise_rollout(all_errs, all_base)["temporal_avg_rad"]
+        table[name] = {"joint0_rad": ta["rot0"], "joint1_rad": ta["rot1"],
+                       "joint0_baseline_rad": ta["rot0_baseline"],
+                       "joint1_baseline_rad": ta["rot1_baseline"]}
+        print(f"{name:>16} | {ta['rot0']:>9.4f} {ta['rot0_baseline']:>10.4f} | "
+              f"{ta['rot1']:>9.4f} {ta['rot1_baseline']:>10.4f}")
+
+    env.close()
+    shadow.close()
+    return table
 
 
 # --------------------------------------------------------------------------- #
@@ -450,6 +567,18 @@ def main():
     p.add_argument("--steps", type=int, default=N_STEPS, help="Steps per live episode.")
     p.add_argument("--no-slide", dest="slide", action="store_false", default=True,
                    help="Park the ground out of reach (held-out generalisation setting).")
+    p.add_argument("--passive", action="store_true",
+                   help="Zero torque throughout each episode — NeRD's §5.2 "
+                        "double-pendulum protocol, for paper-comparable numbers.")
+    p.add_argument("--nerd-grounds", action="store_true",
+                   help="Passive rollout across NeRD's 7-config ground sweep "
+                        "(no-contact + shallow/mid/deep x flat/tilted), reporting "
+                        "per-config temporally-averaged joint error (rad) — the "
+                        "closest direct comparison to the paper's Table 3.")
+    p.add_argument("--ground-episodes", type=int, default=None,
+                   help="Episodes per --nerd-grounds config. Default: --episodes "
+                        "(pass --episodes 0 --ground-episodes N to run only the "
+                        "ground sweep, skipping the regular live-episode eval).")
     p.add_argument("--seed", type=int, default=5_000_000,
                    help="Base episode seed — keep outside the training range.")
     p.add_argument("--use-shards", action="store_true",
@@ -479,7 +608,7 @@ def main():
     results = {"ckpt": os.path.abspath(args.ckpt), "modality": modality,
                "history": history, "meta": meta, "device": device,
                "episodes": args.episodes, "steps": args.steps,
-               "slide": args.slide, "seed": args.seed}
+               "slide": args.slide, "passive": args.passive, "seed": args.seed}
 
     # --- live episodes -------------------------------------------------------
     if args.episodes > 0:
@@ -487,9 +616,11 @@ def main():
             raise SystemExit(f"--steps must be at least history+2 = {history + 2}")
         want_frames = modality == "vision"
         print(f"collecting {args.episodes} live episodes "
-              f"(slide={'on' if args.slide else 'off'}) ...")
+              f"(slide={'on' if args.slide else 'off'}"
+              f"{', passive' if args.passive else ''}) ...")
         env = _make_env(slide=args.slide, rgb_state=want_frames)
-        episodes = [collect_episode(env, args.seed + i, args.steps, want_frames)
+        episodes = [collect_episode(env, args.seed + i, args.steps, want_frames,
+                                    passive=args.passive)
                     for i in range(args.episodes)]
         env.close()
 
@@ -511,7 +642,8 @@ def main():
 
         summary = summarise_rollout(all_errs, all_base)
         results["rollout"] = {"horizon_steps": summary["horizon_steps"],
-                              "at_horizon": summary["at_horizon"]}
+                              "at_horizon": summary["at_horizon"],
+                              "temporal_avg_rad": summary["temporal_avg_rad"]}
 
         np.savez(os.path.join(out_dir, "rollout_curves.npz"),
                  **{f"{k}_{stat}": v
@@ -523,6 +655,21 @@ def main():
             cells = "  ".join(f"{k}: {row[k]['model']:.3f}/{row[k]['baseline']:.3f}"
                               for k in ERR_KEYS)
             print(f"  h={h:>3} | {cells}")
+        ta = summary["temporal_avg_rad"]
+        print(f"\nNeRD-style temporally averaged joint error (rad, model/baseline): "
+              f"joint0 {ta['rot0']:.4f}/{ta['rot0_baseline']:.4f}  "
+              f"joint1 {ta['rot1']:.4f}/{ta['rot1_baseline']:.4f}"
+              + ("" if args.passive else
+                 "  [driven episodes — run with --passive for the paper's protocol]"))
+
+    # --- NeRD §5.2 ground-configuration sweep --------------------------------
+    if args.nerd_grounds:
+        if args.steps < history + 2:
+            raise SystemExit(f"--steps must be at least history+2 = {history + 2}")
+        n_ground_ep = args.ground_episodes if args.ground_episodes is not None else args.episodes
+        print(f"\nNeRD §5.2 ground sweep ({n_ground_ep} episodes/config, "
+              f"passive, {args.steps} steps) ...")
+        results["nerd_grounds"] = nerd_grounds_eval(model, modality, history, device, args)
 
     # --- stored shards --------------------------------------------------------
     if args.use_shards:
