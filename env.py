@@ -354,6 +354,20 @@ class DoublePendulum(gym.Env):
         return info
 
 
+    def _sample_init_quat(self, max_tilt: float) -> np.ndarray:
+        if max_tilt >= np.pi:
+            q = self.np_random.normal(size=4)
+            return q / np.linalg.norm(q)
+        axis = self.np_random.normal(size=3)
+        axis /= np.linalg.norm(axis)
+        denom = 1.0 - np.cos(max_tilt)
+        while True:
+            theta = self.np_random.uniform(0.0, max_tilt)
+            if self.np_random.uniform(0.0, 1.0) <= (1.0 - np.cos(theta)) / denom:
+                break
+        return np.concatenate([[np.cos(theta / 2)], np.sin(theta / 2) * axis])
+
+
     def sample_tau(self) -> np.ndarray:
         """Sample the next exploration torque by exponentially smoothing the last one.
 
@@ -505,17 +519,19 @@ class DoublePendulum(gym.Env):
 
         floor_id = self.model.geom("floor").id
         forced_ground = (options or {}).get("ground")
+        w_cap = (options or {}).get("max_init_w", 4 * np.pi)
+        tilt_cap = (options or {}).get("max_init_tilt", np.pi)
 
         for _ in range(self.max_spawn_resamples):
             # Random initial joint orientations, uniform over rotations: sampling 4
             # i.i.d. Gaussians and normalising gives a uniform point on the unit
             # quaternion sphere (and hence a uniform random rotation).
-            q0 = self.np_random.normal(size=4); q0 /= np.linalg.norm(q0)
-            q1 = self.np_random.normal(size=4); q1 /= np.linalg.norm(q1)
+            q0 = self._sample_init_quat(tilt_cap)
+            q1 = self._sample_init_quat(tilt_cap)
             quats = np.concatenate([q0, q1])
 
             # Random initial joint angular velocities (rad/s), per local axis.
-            angvels = self.np_random.uniform(-4*np.pi, 4*np.pi, size=6)
+            angvels = self.np_random.uniform(-w_cap, w_cap, size=6)
 
             if forced_ground is not None:
                 ground_depth, ground_quat = forced_ground
